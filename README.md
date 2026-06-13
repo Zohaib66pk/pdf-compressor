@@ -1,6 +1,6 @@
 # PDF Compressor
 
-A Python PDF compressor with a browser UI, command-line interface, and Vercel serverless entrypoint. The local app shows live progress while it works toward the required target size, then removes uploaded and generated files after the result is handled.
+A Python PDF compressor with a browser UI, command-line interface, and Vercel serverless entrypoint. The app accepts PDFs up to 100 MB. The local app shows live progress while it works toward the required target size, then removes uploaded and generated files after the result is handled.
 
 ## Install system tools
 
@@ -75,9 +75,12 @@ Raster compression uses 3 parallel workers by default and reports compressed pag
 
 This repo includes:
 
-- `api/index.py`: Vercel Python Function entrypoint.
-- `vercel.json`: routes all web traffic to the Python handler and sets a 300 second function limit.
+- `index.py`: Vercel ASGI entrypoint.
+- `api/blob-upload.js`: short-lived Vercel Blob upload-token endpoint for browser uploads.
+- `public/blob-upload-client.js`: bundled browser upload helper built from `assets/blob-upload-client.js`.
+- `vercel.json`: Vercel project configuration.
 - `requirements.txt`: Python dependencies for Vercel installs.
+- `package.json`: Vercel Blob client upload dependency and build script.
 - `.vercelignore`: excludes local caches, tests, and generated PDFs from the deployment bundle.
 
 Deploy:
@@ -92,7 +95,9 @@ Production deploy:
 npx vercel --prod
 ```
 
-The Vercel handler compresses during the upload request and returns the PDF directly. That keeps uploads, passwords, and generated files out of cross-request storage. The local server keeps the richer progress-page flow because it can safely hold short-lived in-memory job state.
+The Vercel handler uses Vercel Blob when `BLOB_READ_WRITE_TOKEN` is configured. The browser uploads the PDF directly to Blob, the Python function downloads it from Blob for compression, then the original Blob file is deleted. The compressed PDF is uploaded back to Blob for download and is deleted shortly after download starts.
+
+The app's upload limit is 100 MB. Standard Vercel Functions have a much smaller request and response payload limit, so direct uploads fall back to a guarded small-file path if Blob storage is not configured.
 
 For best compression on strict targets, run the local server or deploy to an environment where Ghostscript and Poppler are installed. Standard Vercel Python Functions do not include those system binaries by default.
 

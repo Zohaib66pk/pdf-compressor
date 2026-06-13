@@ -1,0 +1,13 @@
+{
+  "name": "pdf-compressor",
+  "private": true,
+  "scripts": {
+    "build": "npm run build:client && npm run build:api",
+    "build:client": "esbuild assets/blob-upload-client.js --bundle --format=esm --platform=browser --outfile=public/blob-upload-client.js",
+    "build:api": "esbuild assets/blob-upload-handler.js --bundle --format=esm --platform=node --target=node20 --outfile=api/blob-upload.js"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.4.0",
+    "esbuild": "^0.28.1"
+  }
+}

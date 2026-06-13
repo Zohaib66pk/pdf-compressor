@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 import tempfile
 
-from pdf_compressor.server import CompressorRequestHandler, _impact_items, _job_status_payload
+from pdf_compressor.server import CompressorRequestHandler, _impact_items, _job_status_payload, render_home
 
 
 class ServerImpactTests(unittest.TestCase):
@@ -113,6 +113,19 @@ class ServerPrivacyTests(unittest.TestCase):
         self.assertNotIn("path", payload)
         self.assertNotIn("input_path", payload)
         self.assertIn("resultUrl", payload)
+
+
+class ServerRenderTests(unittest.TestCase):
+    def test_blob_upload_mode_shows_100mb_limit_and_script(self):
+        html = render_home(
+            max_file_size_bytes=100 * 1024 * 1024,
+            max_target_size_bytes=100 * 1024 * 1024,
+            blob_upload_enabled=True,
+        )
+
+        self.assertIn("PDF file (max 100.00 MB)", html)
+        self.assertIn('data-blob-upload="true"', html)
+        self.assertIn("/blob-upload-client.js", html)
 
 
 if __name__ == "__main__":

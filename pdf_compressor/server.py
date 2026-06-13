@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from .core import CompressionError, PROFILES, compress_pdf, format_bytes
 
 
-MAX_UPLOAD_BYTES = 300 * 1024 * 1024
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 RESULT_TTL_SECONDS = 30 * 60
 ERROR_TTL_SECONDS = 10 * 60
 CLEANUP_INTERVAL_SECONDS = 60
@@ -397,11 +397,99 @@ def _job_status_payload(job: dict[str, object]) -> dict[str, object]:
     return payload
 
 
-def render_home() -> str:
+def _target_placeholder(max_target_size_bytes: int | None) -> str:
+    if max_target_size_bytes is None:
+        return "5"
+    target_mb = max_target_size_bytes / (1024 * 1024)
+    return f"{target_mb:.2f}".rstrip("0").rstrip(".")
+
+
+def _render_hosted_limit_note(max_file_size_bytes: int | None, max_target_size_bytes: int | None) -> str:
+    if max_file_size_bytes is None and max_target_size_bytes is None:
+        return ""
+
+    parts: list[str] = []
+    if max_file_size_bytes is not None:
+        parts.append(f"uploads up to {format_bytes(max_file_size_bytes)}")
+    if max_target_size_bytes is not None:
+        parts.append(f"downloads up to {format_bytes(max_target_size_bytes)}")
+    limit_text = " and ".join(parts)
+    return (
+        '<p class="privacy-note hosted-note">'
+        f"This hosted version supports {escape(limit_text)}. "
+        "For larger PDFs, use the local app or a storage-backed upload setup."
+        "</p>"
+    )
+
+
+def _render_client_size_guard(max_file_size_bytes: int | None, max_target_size_bytes: int | None) -> str:
+    if max_file_size_bytes is None and max_target_size_bytes is None:
+        return ""
+
+    file_limit = "null" if max_file_size_bytes is None else str(max_file_size_bytes)
+    target_limit = "null" if max_target_size_bytes is None else str(max_target_size_bytes)
+    file_label = format_bytes(max_file_size_bytes) if max_file_size_bytes is not None else ""
+    target_label = format_bytes(max_target_size_bytes) if max_target_size_bytes is not None else ""
+    return f"""
+        <script>
+          (() => {{
+            const form = document.querySelector(".compress-form");
+            const error = document.getElementById("clientError");
+            if (!form || !error) {{
+              return;
+            }}
+
+            const maxFileBytes = {file_limit};
+            const maxTargetBytes = {target_limit};
+            const maxFileLabel = "{escape(file_label)}";
+            const maxTargetLabel = "{escape(target_label)}";
+
+            form.addEventListener("submit", (event) => {{
+              const fileInput = form.elements.namedItem("pdf");
+              const targetInput = form.elements.namedItem("target_size_mb");
+              const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+              const targetMb = Number(targetInput ? targetInput.value : 0);
+              const targetBytes = targetMb * 1024 * 1024;
+              let message = "";
+
+              if (maxFileBytes && file && file.size > maxFileBytes) {{
+                message = "This version supports PDFs up to " + maxFileLabel + ". Choose a smaller PDF, or use the local app for larger files.";
+              }} else if (maxTargetBytes && targetBytes > maxTargetBytes) {{
+                message = "This version can return compressed files up to " + maxTargetLabel + ". Choose a smaller target size, or use the local app for larger files.";
+              }}
+
+              if (message) {{
+                event.preventDefault();
+                error.textContent = message;
+                error.classList.remove("hidden");
+                error.setAttribute("tabindex", "-1");
+                error.focus();
+              }} else {{
+                error.textContent = "";
+                error.classList.add("hidden");
+              }}
+            }});
+          }})();
+        </script>
+    """
+
+
+def render_home(
+    *,
+    max_file_size_bytes: int | None = None,
+    max_target_size_bytes: int | None = None,
+    blob_upload_enabled: bool = False,
+) -> str:
     options = "\n".join(
         f'<option value="{escape(profile.name)}">{escape(profile.label)}</option>'
         for profile in PROFILES.values()
     )
+    target_placeholder = _target_placeholder(max_target_size_bytes)
+    hosted_note = _render_hosted_limit_note(max_file_size_bytes, max_target_size_bytes)
+    client_guard = _render_client_size_guard(max_file_size_bytes, max_target_size_bytes)
+    upload_limit_label = format_bytes(max_file_size_bytes or MAX_UPLOAD_BYTES)
+    blob_upload_attr = ' data-blob-upload="true"' if blob_upload_enabled else ""
+    blob_upload_script = '<script type="module" src="/blob-upload-client.js"></script>' if blob_upload_enabled else ""
     return _page(
         "PDF Compressor",
         f"""
@@ -415,9 +503,9 @@ def render_home() -> str:
               <span class="status">Ready</span>
             </div>
 
-            <form class="compress-form" action="/compress" method="post" enctype="multipart/form-data">
+            <form class="compress-form" action="/compress" method="post" enctype="multipart/form-data" data-max-upload-bytes="{max_file_size_bytes or MAX_UPLOAD_BYTES}"{blob_upload_attr}>
               <label class="file-drop">
-                <span>PDF file</span>
+                <span>PDF file (max {escape(upload_limit_label)})</span>
                 <input type="file" name="pdf" accept="application/pdf,.pdf" required>
               </label>
 
@@ -428,7 +516,7 @@ def render_home() -> str:
                 </label>
                 <label>
                   <span>Required size (MB)</span>
-                  <input type="number" name="target_size_mb" min="0.01" step="0.01" placeholder="5" required>
+                  <input type="number" name="target_size_mb" min="0.01" step="0.01" placeholder="{target_placeholder}" required>
                 </label>
               </div>
 
@@ -437,12 +525,22 @@ def render_home() -> str:
                 <input type="password" name="password" autocomplete="current-password" placeholder="Leave empty for unlocked PDFs">
               </label>
 
+              <div class="client-error hidden" id="clientError"></div>
+              <div class="upload-status hidden" id="uploadStatus">
+                <div class="mini-progress" aria-label="Upload progress">
+                  <div class="mini-progress-meter" id="uploadProgressMeter"></div>
+                </div>
+                <p id="uploadStatusText">Preparing your PDF</p>
+              </div>
               <button type="submit">Compress PDF</button>
             </form>
 
             <p class="privacy-note">Files are cleaned up after processing and download.</p>
+            {hosted_note}
           </section>
         </main>
+        {client_guard}
+        {blob_upload_script}
         """,
     )
 
@@ -565,6 +663,61 @@ def render_result(job: dict[str, object]) -> str:
             <p class="cleanup-note">The server copy is removed after download or after it expires.</p>
           </section>
         </main>
+        """,
+    )
+
+
+def render_blob_result(job: dict[str, object], *, download_url: str, cleanup_url: str) -> str:
+    saved = int(job["bytes_saved"])
+    saved_class = "positive" if saved >= 0 else "negative"
+    target_size = int(job["target_size_bytes"])
+    impact_html = _render_impact(job)
+    return _page(
+        "Your PDF Is Ready",
+        f"""
+        <main class="shell">
+          <section class="tool-panel">
+            <div class="panel-heading">
+              <div>
+                <h1>Your PDF is ready</h1>
+                <p class="lead">Download your compressed PDF.</p>
+              </div>
+              <span class="status">Ready</span>
+            </div>
+            <dl class="stats">
+              <div><dt>Profile</dt><dd>{escape(str(job["profile"]))}</dd></div>
+              <div><dt>Compression used</dt><dd>{escape(str(job["method"]))}</dd></div>
+              <div><dt>Original</dt><dd>{format_bytes(int(job["original_size"]))}</dd></div>
+              <div><dt>Output</dt><dd>{format_bytes(int(job["compressed_size"]))}</dd></div>
+              <div><dt>Target</dt><dd>{format_bytes(target_size)}</dd></div>
+              <div><dt>Savings</dt><dd class="{saved_class}">{format_bytes(saved)} ({float(job["savings_percent"]):.1f}%)</dd></div>
+            </dl>
+            {impact_html}
+            <div class="actions">
+              <a class="button" id="blobDownloadLink" href="{escape(download_url)}">Download PDF</a>
+              <a class="secondary" href="/">Compress another</a>
+            </div>
+            <p class="cleanup-note">The uploaded PDF was removed after compression. The compressed file is removed shortly after download starts.</p>
+          </section>
+        </main>
+        <script>
+          const downloadLink = document.getElementById("blobDownloadLink");
+          if (downloadLink) {{
+            downloadLink.addEventListener("click", () => {{
+              const payload = JSON.stringify({{ url: {json.dumps(cleanup_url)} }});
+              window.setTimeout(() => {{
+                if (!navigator.sendBeacon || !navigator.sendBeacon("/cleanup-blob", payload)) {{
+                  fetch("/cleanup-blob", {{
+                    method: "POST",
+                    headers: {{ "content-type": "application/json" }},
+                    body: payload,
+                    keepalive: true,
+                  }}).catch(() => {{}});
+                }}
+              }}, 30000);
+            }}, {{ once: true }});
+          }}
+        </script>
         """,
     )
 
@@ -847,6 +1000,40 @@ def _page(title: str, body: str) -> str:
       font-weight: 800;
       padding: 7px 12px;
       cursor: pointer;
+    }}
+    .client-error {{
+      border: 1px solid #e2aaa0;
+      border-radius: 8px;
+      background: #fff7f5;
+      color: var(--bad);
+      padding: 12px 14px;
+      font-size: 0.94rem;
+      line-height: 1.45;
+      font-weight: 750;
+    }}
+    .upload-status {{
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-weight: 750;
+    }}
+    .upload-status p {{
+      margin: 0;
+      overflow-wrap: anywhere;
+    }}
+    .mini-progress {{
+      height: 10px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #eef0ea;
+    }}
+    .mini-progress-meter {{
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+      transition: width 180ms ease;
     }}
     input:focus,
     select:focus,

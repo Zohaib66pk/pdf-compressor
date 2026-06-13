@@ -5,9 +5,11 @@ description = "Python PDF compression app with a browser UI, CLI, and Vercel ent
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.117.1",
     "pdf2image>=1.17.0",
     "pikepdf>=10.0.0",
     "pillow>=12.0",
+    "python-multipart>=0.0.20",
 ]
 
 [project.scripts]
