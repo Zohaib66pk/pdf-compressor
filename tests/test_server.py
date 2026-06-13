@@ -128,6 +128,8 @@ class ServerRenderTests(unittest.TestCase):
         self.assertIn("/blob-upload-client.js", html)
         self.assertIn("File uploading", html)
         self.assertIn("Compression in progress", html)
+        self.assertNotIn("uploadStatusText", html)
+        self.assertNotIn("Preparing your PDF", html)
         self.assertNotIn("Uploading file", html)
         self.assertNotIn("Compressed file ready", html)
 

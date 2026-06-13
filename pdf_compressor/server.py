@@ -530,7 +530,6 @@ def render_home(
                 <div class="progress-shell" aria-label="PDF progress">
                   <div class="progress-meter" id="uploadProgressMeter"></div>
                 </div>
-                <p id="uploadStatusText">Preparing your PDF</p>
                 <div class="status-steps" aria-label="Compression status">
                   <div class="status-step" id="stepFile"><span class="step-mark"></span><span id="stepFileText">File uploading</span></div>
                   <div class="status-step" id="stepCompressing"><span class="step-mark"></span><span>Compression in progress</span></div>
