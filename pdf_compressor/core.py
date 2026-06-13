@@ -1,13 +1,11 @@
-"""Core PDF compression logic.
-
-The heavy lifting is delegated to Ghostscript's ``pdfwrite`` device. That is
-the practical route for strong PDF compression because the largest savings
-usually come from image downsampling and stream re-encoding.
-"""
+"""Core PDF compression logic."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +19,14 @@ class CompressionError(RuntimeError):
 
 class GhostscriptMissingError(CompressionError):
     """Raised when no Ghostscript executable can be found."""
+
+
+class PdfRasterDependencyError(CompressionError):
+    """Raised when Poppler, pdf2image, or Pillow are not available."""
+
+
+class PdfImageRecompressionError(CompressionError):
+    """Raised when embedded image recompression cannot run."""
 
 
 class CompressionNotUsefulError(CompressionError):
@@ -46,6 +52,43 @@ class CompressionCandidate:
 
 
 @dataclass(frozen=True)
+class RasterSetting:
+    dpi: int
+    quality: int
+    grayscale: bool = False
+
+    @property
+    def label(self) -> str:
+        if self.grayscale:
+            return "Page-by-page compression with reduced color"
+        return "Page-by-page compression"
+
+    @property
+    def filename_suffix(self) -> str:
+        color_mode = "gray" if self.grayscale else "color"
+        return f"{color_mode}-{self.dpi}dpi-q{self.quality}"
+
+
+@dataclass(frozen=True)
+class Jpeg2000Setting:
+    compression_ratio: int
+
+    @property
+    def label(self) -> str:
+        return "Image compression that keeps text selectable"
+
+    @property
+    def filename_suffix(self) -> str:
+        return f"jpx-r{self.compression_ratio}"
+
+
+@dataclass(frozen=True)
+class ImageRecompressionStats:
+    images_seen: int
+    images_recompressed: int
+
+
+@dataclass(frozen=True)
 class CompressionResult:
     input_path: Path
     output_path: Path
@@ -53,6 +96,7 @@ class CompressionResult:
     original_size: int
     compressed_size: int
     method: str
+    worker_count: int = 1
 
     @property
     def bytes_saved(self) -> int:
@@ -66,6 +110,8 @@ class CompressionResult:
 
 
 ProgressCallback = Callable[[int, str], None]
+CountProgressCallback = Callable[[int, int], None]
+DEFAULT_WORKER_COUNT = 3
 
 
 BASE_ARGS: tuple[str, ...] = (
@@ -170,10 +216,63 @@ PROFILES: dict[str, CompressionProfile] = {
 }
 
 
+STANDARD_MAX_RASTER_SETTINGS: tuple[RasterSetting, ...] = (
+    RasterSetting(110, 48),
+    RasterSetting(90, 40),
+    RasterSetting(72, 34),
+)
+
+
+STANDARD_JPEG2000_SETTINGS: dict[str, tuple[Jpeg2000Setting, ...]] = {
+    "max": (Jpeg2000Setting(18),),
+    "screen": (Jpeg2000Setting(16),),
+    "ebook": (Jpeg2000Setting(12),),
+    "printer": (Jpeg2000Setting(8),),
+}
+
+
+TARGET_JPEG2000_RATIOS: tuple[int, ...] = (10, 14, 18, 24, 32, 45, 60)
+
+
+TARGET_RASTER_SETTINGS: tuple[RasterSetting, ...] = (
+    RasterSetting(110, 48),
+    RasterSetting(96, 44),
+    RasterSetting(90, 40),
+    RasterSetting(84, 38),
+    RasterSetting(78, 36),
+    RasterSetting(72, 34),
+    RasterSetting(68, 32),
+    RasterSetting(64, 30),
+    RasterSetting(60, 28),
+    RasterSetting(56, 26),
+    RasterSetting(52, 24),
+    RasterSetting(48, 22),
+    RasterSetting(44, 20),
+    RasterSetting(40, 18),
+    RasterSetting(36, 16),
+    RasterSetting(32, 14),
+    RasterSetting(28, 12),
+    RasterSetting(24, 10),
+    RasterSetting(72, 32, grayscale=True),
+    RasterSetting(60, 26, grayscale=True),
+    RasterSetting(48, 20, grayscale=True),
+    RasterSetting(40, 16, grayscale=True),
+    RasterSetting(32, 12, grayscale=True),
+    RasterSetting(24, 9, grayscale=True),
+    RasterSetting(18, 7, grayscale=True),
+)
+
+
 def find_ghostscript() -> str | None:
     """Return the first available Ghostscript executable."""
 
     return shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+
+
+def find_pdftoppm() -> str | None:
+    """Return the Poppler pdftoppm executable if it is available."""
+
+    return shutil.which("pdftoppm")
 
 
 def get_profile(profile_name: str) -> CompressionProfile:
@@ -194,6 +293,7 @@ def build_ghostscript_command(
     output_path: Path | str,
     profile_name: str = "max",
     ghostscript_path: str | None = None,
+    password: str | None = None,
 ) -> list[str]:
     """Build the Ghostscript command without executing it."""
 
@@ -202,13 +302,15 @@ def build_ghostscript_command(
     if executable is None:
         raise GhostscriptMissingError(_missing_ghostscript_message())
 
-    return [
+    command = [
         executable,
         *BASE_ARGS,
         *profile.args,
-        f"-sOutputFile={Path(output_path)}",
-        str(Path(input_path)),
     ]
+    if password:
+        command.append(f"-sPDFPassword={password}")
+    command.extend([f"-sOutputFile={Path(output_path)}", str(Path(input_path))])
+    return command
 
 
 def compress_pdf(
@@ -219,6 +321,8 @@ def compress_pdf(
     allow_larger: bool = False,
     target_size_bytes: int | None = None,
     progress_callback: ProgressCallback | None = None,
+    password: str | None = None,
+    worker_count: int | None = None,
 ) -> CompressionResult:
     """Compress a PDF and return compression statistics."""
 
@@ -246,7 +350,10 @@ def compress_pdf(
     if target_size_bytes is not None and target_size_bytes <= 0:
         raise CompressionError("Target output size must be greater than zero.")
 
-    _notify_progress(progress_callback, 8, "Preparing PDF")
+    _notify_progress(progress_callback, 6, "Checking your PDF")
+    page_count = _validate_pdf(source, password=password, context="Input PDF")
+    resolved_worker_count = _resolve_worker_count(worker_count, page_count)
+    _notify_progress(progress_callback, 8, f"Preparing {page_count} pages")
     with tempfile.TemporaryDirectory(prefix="pdf-compressor-candidates-", dir=destination.parent) as tmp:
         candidate_dir = Path(tmp)
         candidates = _create_candidates(
@@ -255,12 +362,17 @@ def compress_pdf(
             profile,
             ghostscript_path=ghostscript_path,
             progress_callback=progress_callback,
+            target_size_bytes=target_size_bytes,
+            original_size=original_size,
+            page_count=page_count,
+            password=password,
+            worker_count=resolved_worker_count,
         )
 
         if not candidates:
             raise CompressionError("No compression candidate was created.")
 
-        best = min(candidates, key=lambda candidate: candidate.path.stat().st_size)
+        best = _select_best_candidate(candidates, target_size_bytes, original_size=original_size)
         best_size = best.path.stat().st_size
         if target_size_bytes is not None and best_size > target_size_bytes:
             attempted = ", ".join(
@@ -282,9 +394,11 @@ def compress_pdf(
                 f"Attempts: {attempted}."
             )
 
-        _notify_progress(progress_callback, 92, "Saving compressed PDF")
+        _notify_progress(progress_callback, 92, "Saving your compressed PDF")
         best.path.replace(destination)
 
+    _notify_progress(progress_callback, 96, "Checking the compressed file")
+    _validate_pdf(destination, context="Compressed output")
     _notify_progress(progress_callback, 98, "Compression complete")
     return CompressionResult(
         input_path=source,
@@ -293,6 +407,7 @@ def compress_pdf(
         original_size=original_size,
         compressed_size=destination.stat().st_size,
         method=best.label,
+        worker_count=resolved_worker_count,
     )
 
 
@@ -315,50 +430,241 @@ def _create_candidates(
     profile: CompressionProfile,
     ghostscript_path: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    target_size_bytes: int | None = None,
+    original_size: int | None = None,
+    page_count: int = 0,
+    password: str | None = None,
+    worker_count: int = 1,
 ) -> list[CompressionCandidate]:
     candidates: list[CompressionCandidate] = []
+    jpeg2000_settings = _jpeg2000_settings_for_profile(profile.name, target_size_bytes, original_size)
 
     if profile.name == "max":
         profile_names = ("max", "screen", "ebook")
-        raster_settings = (
-            (110, 48),
-            (90, 40),
-            (72, 34),
-        )
+        raster_settings = _raster_settings_for_target(target_size_bytes, STANDARD_MAX_RASTER_SETTINGS)
     else:
         profile_names = (profile.name,)
-        raster_settings = ()
+        raster_settings = _raster_settings_for_target(target_size_bytes, ())
 
-    total_attempts = len(profile_names) + len(raster_settings)
+    total_attempts = len(jpeg2000_settings) + len(profile_names) + len(raster_settings)
     completed_attempts = 0
+    stop_jpeg2000_attempts = False
+
+    for index, setting in enumerate(jpeg2000_settings, start=1):
+        label = setting.label
+        output = candidate_dir / f"pikepdf-{index}-{setting.filename_suffix}.pdf"
+
+        def image_progress(completed: int, total: int) -> None:
+            page_progress = _attempt_item_progress(completed_attempts, total_attempts, completed, total)
+            _notify_progress(progress_callback, page_progress, f"Compressing images: {completed} of {total}")
+
+        try:
+            stats = _run_pikepdf_jpeg2000_recompress(
+                source,
+                output,
+                setting=setting,
+                password=password,
+                image_progress_callback=image_progress,
+            )
+        except PdfImageRecompressionError as exc:
+            _delete_if_present(output)
+            _notify_progress(
+                progress_callback,
+                _attempt_progress(completed_attempts + 1, total_attempts),
+                "Moving to the next compression step",
+            )
+            stats = ImageRecompressionStats(images_seen=0, images_recompressed=0)
+
+        if output.exists() and output.stat().st_size > 0:
+            candidate_label = label
+            if stats.images_recompressed == 0:
+                candidate_label = "Light cleanup without changing quality"
+                stop_jpeg2000_attempts = True
+            candidates.append(CompressionCandidate(output, candidate_label))
+            if _has_useful_candidate_under_target([candidates[-1]], target_size_bytes, original_size):
+                _notify_progress(
+                    progress_callback,
+                    _attempt_progress(completed_attempts + 1, total_attempts),
+                    "Target size reached after compressing images",
+                )
+                return candidates
+
+        completed_attempts += 1
+        if stop_jpeg2000_attempts:
+            break
 
     for profile_name in profile_names:
-        label = f"Ghostscript {get_profile(profile_name).label}"
-        _notify_progress(progress_callback, _attempt_progress(completed_attempts, total_attempts), f"Running {label}")
+        label = _optimization_candidate_label(profile_name)
+        _notify_progress(
+            progress_callback,
+            _attempt_progress(completed_attempts, total_attempts),
+            f"{label}",
+        )
         output = candidate_dir / f"{profile_name}.pdf"
-        _run_ghostscript_pdfwrite(source, output, profile_name, ghostscript_path=ghostscript_path)
+        _run_ghostscript_pdfwrite(source, output, profile_name, ghostscript_path=ghostscript_path, password=password)
         if output.exists() and output.stat().st_size > 0:
             candidates.append(CompressionCandidate(output, label))
         completed_attempts += 1
-        _notify_progress(progress_callback, _attempt_progress(completed_attempts, total_attempts), f"Finished {label}")
+        _notify_progress(progress_callback, _attempt_progress(completed_attempts, total_attempts), "Checking file size")
 
-    for index, (dpi, quality) in enumerate(raster_settings, start=1):
-        label = f"Raster JPEG {dpi} DPI, quality {quality}"
-        _notify_progress(progress_callback, _attempt_progress(completed_attempts, total_attempts), f"Running {label}")
-        output = candidate_dir / f"raster-{index}-{dpi}dpi-q{quality}.pdf"
-        _run_raster_pdf(source, output, dpi=dpi, quality=quality, ghostscript_path=ghostscript_path)
+    if _has_useful_candidate_under_target(candidates, target_size_bytes, original_size):
+        return candidates
+
+    for index, setting in enumerate(raster_settings, start=1):
+        label = setting.label
+        output = candidate_dir / f"raster-{index}-{setting.filename_suffix}.pdf"
+
+        def page_progress(completed: int, total: int) -> None:
+            raster_progress = _attempt_item_progress(completed_attempts, total_attempts, completed, total)
+            _notify_progress(progress_callback, raster_progress, f"Compressing pages: {completed} of {total}")
+
+        _run_raster_pdf(
+            source,
+            output,
+            setting=setting,
+            ghostscript_path=ghostscript_path,
+            page_count=page_count,
+            password=password,
+            worker_count=worker_count,
+            page_progress_callback=page_progress,
+        )
         if output.exists() and output.stat().st_size > 0:
-            candidates.append(CompressionCandidate(output, label))
+            candidate = CompressionCandidate(output, label)
+            candidates.append(candidate)
+            if _has_useful_candidate_under_target([candidate], target_size_bytes, original_size):
+                _notify_progress(
+                    progress_callback,
+                    _attempt_progress(completed_attempts + 1, total_attempts),
+                    f"Target size reached after compressing {page_count} pages",
+                )
+                return candidates
         completed_attempts += 1
-        _notify_progress(progress_callback, _attempt_progress(completed_attempts, total_attempts), f"Finished {label}")
 
     return candidates
+
+
+def _raster_settings_for_target(
+    target_size_bytes: int | None,
+    default_settings: tuple[RasterSetting, ...],
+) -> tuple[RasterSetting, ...]:
+    if target_size_bytes is None:
+        return default_settings
+
+    settings = list(TARGET_RASTER_SETTINGS)
+    for candidate in default_settings:
+        if candidate not in settings:
+            settings.append(candidate)
+    return tuple(settings)
+
+
+def _optimization_candidate_label(profile_name: str) -> str:
+    labels = {
+        "max": "Reducing file size as much as possible",
+        "screen": "Making the PDF smaller for sharing",
+        "ebook": "Balancing size and readability",
+        "printer": "Keeping print quality while reducing size",
+        "lossless": "Cleaning up the PDF without changing quality",
+    }
+    return labels.get(profile_name, "Reducing PDF size")
+
+
+def _jpeg2000_settings_for_profile(
+    profile_name: str,
+    target_size_bytes: int | None,
+    original_size: int | None = None,
+) -> tuple[Jpeg2000Setting, ...]:
+    if target_size_bytes is not None:
+        return (Jpeg2000Setting(_jpeg2000_ratio_for_target(target_size_bytes, original_size)),)
+    return STANDARD_JPEG2000_SETTINGS.get(profile_name, ())
+
+
+def _jpeg2000_ratio_for_target(target_size_bytes: int, original_size: int | None) -> int:
+    if not original_size or target_size_bytes <= 0:
+        return TARGET_JPEG2000_RATIOS[0]
+
+    requested_ratio = original_size / target_size_bytes
+    if requested_ratio <= 2:
+        desired_ratio = 10
+    elif requested_ratio <= 4:
+        desired_ratio = 14
+    elif requested_ratio <= 6:
+        desired_ratio = 18
+    elif requested_ratio <= 10:
+        desired_ratio = 24
+    elif requested_ratio <= 16:
+        desired_ratio = 32
+    elif requested_ratio <= 25:
+        desired_ratio = 45
+    else:
+        desired_ratio = 60
+
+    for ratio in TARGET_JPEG2000_RATIOS:
+        if ratio >= desired_ratio:
+            return ratio
+    return TARGET_JPEG2000_RATIOS[-1]
+
+
+def _select_best_candidate(
+    candidates: list[CompressionCandidate],
+    target_size_bytes: int | None,
+    original_size: int | None = None,
+) -> CompressionCandidate:
+    if target_size_bytes is None:
+        return min(candidates, key=lambda candidate: candidate.path.stat().st_size)
+
+    under_target = [candidate for candidate in candidates if candidate.path.stat().st_size <= target_size_bytes]
+    useful_under_target = [
+        candidate for candidate in under_target if original_size is None or candidate.path.stat().st_size < original_size
+    ]
+    if useful_under_target:
+        return max(useful_under_target, key=lambda candidate: candidate.path.stat().st_size)
+    if under_target:
+        return max(under_target, key=lambda candidate: candidate.path.stat().st_size)
+    return min(candidates, key=lambda candidate: candidate.path.stat().st_size)
+
+
+def _has_useful_candidate_under_target(
+    candidates: list[CompressionCandidate],
+    target_size_bytes: int | None,
+    original_size: int | None,
+) -> bool:
+    if target_size_bytes is None:
+        return False
+    return any(
+        candidate.path.stat().st_size <= target_size_bytes
+        and (original_size is None or candidate.path.stat().st_size < original_size)
+        for candidate in candidates
+    )
+
+
+def _resolve_worker_count(worker_count: int | None, page_count: int) -> int:
+    if page_count <= 1:
+        return 1
+    if worker_count is not None:
+        if worker_count <= 0:
+            raise CompressionError("Worker count must be greater than zero.")
+        return min(worker_count, page_count)
+
+    cpu_count = os.cpu_count() or 1
+    return min(DEFAULT_WORKER_COUNT, cpu_count, page_count)
 
 
 def _attempt_progress(completed_attempts: int, total_attempts: int) -> int:
     if total_attempts <= 0:
         return 15
     return 15 + round((completed_attempts / total_attempts) * 70)
+
+
+def _attempt_item_progress(
+    completed_attempts: int,
+    total_attempts: int,
+    completed_items: int,
+    total_items: int,
+) -> int:
+    if total_attempts <= 0:
+        return 15
+    item_fraction = 0.0 if total_items <= 0 else completed_items / total_items
+    return 15 + round(((completed_attempts + item_fraction) / total_attempts) * 70)
 
 
 def _notify_progress(callback: ProgressCallback | None, progress: int, message: str) -> None:
@@ -372,45 +678,345 @@ def _run_ghostscript_pdfwrite(
     output: Path,
     profile_name: str,
     ghostscript_path: str | None = None,
+    password: str | None = None,
 ) -> None:
-    command = build_ghostscript_command(source, output, profile_name, ghostscript_path=ghostscript_path)
+    command = build_ghostscript_command(source, output, profile_name, ghostscript_path=ghostscript_path, password=password)
     _run_command(command, output)
+
+
+def _run_pikepdf_jpeg2000_recompress(
+    source: Path,
+    output: Path,
+    setting: Jpeg2000Setting,
+    password: str | None = None,
+    image_progress_callback: CountProgressCallback | None = None,
+) -> ImageRecompressionStats:
+    pikepdf, PdfImage, Image, _features = _load_pikepdf_image_tools()
+    images_seen = 0
+    images_recompressed = 0
+
+    try:
+        pdf = pikepdf.open(source, password=password or "")
+    except Exception as exc:
+        raise PdfImageRecompressionError(f"pikepdf could not open the PDF.{_dependency_detail(exc)}") from exc
+
+    with pdf:
+        images = _unique_pdf_images(pdf)
+        total_images = len(images)
+        if image_progress_callback is not None:
+            image_progress_callback(0, total_images)
+
+        for image_object in images:
+            images_seen += 1
+            if _recompress_pdf_image_to_jpeg2000(
+                image_object,
+                pikepdf=pikepdf,
+                PdfImage=PdfImage,
+                Image=Image,
+                setting=setting,
+            ):
+                images_recompressed += 1
+
+            if image_progress_callback is not None:
+                image_progress_callback(images_seen, total_images)
+
+        try:
+            pdf.save(
+                output,
+                min_version="1.5",
+                compress_streams=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                recompress_flate=True,
+            )
+        except Exception as exc:
+            _delete_if_present(output)
+            raise PdfImageRecompressionError(f"pikepdf could not save the recompressed PDF.{_dependency_detail(exc)}") from exc
+
+    return ImageRecompressionStats(images_seen=images_seen, images_recompressed=images_recompressed)
+
+
+def _unique_pdf_images(pdf: object) -> list[object]:
+    images: list[object] = []
+    seen: set[object] = set()
+
+    for page in pdf.pages:
+        for image_object in page.images.values():
+            key: object
+            try:
+                key = tuple(image_object.objgen) if image_object.is_indirect else id(image_object)
+            except Exception:
+                key = id(image_object)
+            if key in seen:
+                continue
+            seen.add(key)
+            images.append(image_object)
+
+    return images
+
+
+def _recompress_pdf_image_to_jpeg2000(
+    image_object: object,
+    *,
+    pikepdf: object,
+    PdfImage: object,
+    Image: object,
+    setting: Jpeg2000Setting,
+) -> bool:
+    try:
+        pdf_image = PdfImage(image_object)
+        if pdf_image.image_mask:
+            return False
+        raw_size = len(image_object.read_raw_bytes())
+        original_image = pdf_image.as_pil_image()
+    except Exception:
+        return False
+
+    image = original_image
+    try:
+        if image.mode in {"RGBA", "LA"} or ("transparency" in image.info):
+            return False
+        if image.mode not in {"RGB", "L", "CMYK"}:
+            image = image.convert("RGB")
+
+        buffer = io.BytesIO()
+        image.save(
+            buffer,
+            format="JPEG2000",
+            quality_mode="rates",
+            quality_layers=[setting.compression_ratio],
+            irreversible=True,
+        )
+        encoded = buffer.getvalue()
+        if not encoded or len(encoded) >= raw_size:
+            return False
+
+        image_object.write(encoded, filter=pikepdf.Name("/JPXDecode"), decode_parms=None)
+        _set_jpeg2000_image_metadata(image_object, pikepdf=pikepdf, image=image)
+        return True
+    except Exception:
+        return False
+    finally:
+        if image is not original_image:
+            image.close()
+        original_image.close()
+
+
+def _set_jpeg2000_image_metadata(image_object: object, *, pikepdf: object, image: object) -> None:
+    color_space = {
+        "L": "/DeviceGray",
+        "CMYK": "/DeviceCMYK",
+    }.get(image.mode, "/DeviceRGB")
+    image_object[pikepdf.Name("/ColorSpace")] = pikepdf.Name(color_space)
+    image_object[pikepdf.Name("/BitsPerComponent")] = 8
+    image_object[pikepdf.Name("/Width")] = image.width
+    image_object[pikepdf.Name("/Height")] = image.height
+    for key in ("/Decode", "/DecodeParms"):
+        try:
+            del image_object[pikepdf.Name(key)]
+        except (KeyError, ValueError):
+            pass
 
 
 def _run_raster_pdf(
     source: Path,
     output: Path,
-    dpi: int,
-    quality: int,
+    setting: RasterSetting,
     ghostscript_path: str | None = None,
+    page_count: int = 0,
+    password: str | None = None,
+    worker_count: int = 1,
+    page_progress_callback: CountProgressCallback | None = None,
 ) -> None:
-    executable = ghostscript_path or find_ghostscript()
-    if executable is None:
-        raise GhostscriptMissingError(_missing_ghostscript_message())
+    del ghostscript_path
+    convert_from_path, _pdfinfo_from_path = _load_pdf_raster_tools()
 
     with tempfile.TemporaryDirectory(prefix="pdf-compressor-pages-", dir=output.parent) as tmp:
         page_dir = Path(tmp)
-        page_pattern = page_dir / "page-%05d.jpg"
-        command = [
-            executable,
-            "-q",
-            "-dNOPAUSE",
-            "-dBATCH",
-            "-dSAFER",
-            "-sDEVICE=jpeg",
-            f"-r{dpi}",
-            f"-dJPEGQ={quality}",
-            "-dTextAlphaBits=4",
-            "-dGraphicsAlphaBits=4",
-            f"-sOutputFile={page_pattern}",
-            str(source),
-        ]
-        _run_command(command, None)
-
-        images = sorted(page_dir.glob("page-*.jpg"))
+        page_total = page_count or _validate_pdf(source, password=password, context="Input PDF")
+        workers = _resolve_worker_count(worker_count, page_total)
+        if page_progress_callback is not None:
+            page_progress_callback(0, page_total)
+        images = _render_raster_pages(
+            convert_from_path,
+            source,
+            page_dir,
+            page_total=page_total,
+            setting=setting,
+            password=password,
+            worker_count=workers,
+            page_progress_callback=page_progress_callback,
+        )
         if not images:
-            raise CompressionError("Ghostscript did not render any pages for raster compression.")
-        _write_jpeg_pdf(images, output, dpi=dpi)
+            raise CompressionError("Poppler did not render any pages for raster compression.")
+        _write_jpeg_pdf(images, output, dpi=setting.dpi)
+
+
+def _render_raster_pages(
+    convert_from_path: Callable[..., list[object]],
+    source: Path,
+    page_dir: Path,
+    *,
+    page_total: int,
+    setting: RasterSetting,
+    password: str | None,
+    worker_count: int,
+    page_progress_callback: CountProgressCallback | None = None,
+) -> list[Path]:
+    if worker_count <= 1 or page_total <= 1:
+        images = []
+        for page_number in range(1, page_total + 1):
+            images.append(_render_raster_page(convert_from_path, source, page_dir, page_number, setting, password))
+            if page_progress_callback is not None:
+                page_progress_callback(page_number, page_total)
+        return images
+
+    images_by_page: dict[int, Path] = {}
+    completed_pages = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                _render_raster_page,
+                convert_from_path,
+                source,
+                page_dir,
+                page_number,
+                setting,
+                password,
+            ): page_number
+            for page_number in range(1, page_total + 1)
+        }
+        for future in as_completed(futures):
+            page_number = futures[future]
+            images_by_page[page_number] = future.result()
+            completed_pages += 1
+            if page_progress_callback is not None:
+                page_progress_callback(completed_pages, page_total)
+
+    return [images_by_page[page_number] for page_number in sorted(images_by_page)]
+
+
+def _render_raster_page(
+    convert_from_path: Callable[..., list[object]],
+    source: Path,
+    page_dir: Path,
+    page_number: int,
+    setting: RasterSetting,
+    password: str | None,
+) -> Path:
+    rendered = convert_from_path(
+        str(source),
+        dpi=setting.dpi,
+        first_page=page_number,
+        last_page=page_number,
+        thread_count=1,
+        grayscale=setting.grayscale,
+        userpw=password,
+    )
+    if len(rendered) != 1:
+        raise CompressionError(f"Poppler did not render page {page_number}.")
+
+    original_image = rendered[0]
+    image = original_image
+    try:
+        mode = "L" if setting.grayscale else "RGB"
+        if image.mode != mode:
+            image = image.convert(mode)
+        image_path = page_dir / f"page-{page_number:05d}.jpg"
+        image.save(image_path, "JPEG", quality=setting.quality, optimize=True)
+        return image_path
+    finally:
+        if image is not original_image:
+            image.close()
+        original_image.close()
+
+
+def _validate_pdf(path: Path, password: str | None = None, context: str = "PDF") -> int:
+    try:
+        return _validate_pdf_with_pikepdf(path, password=password, context=context)
+    except ImportError:
+        return _validate_pdf_with_poppler(path, password=password, context=context)
+
+
+def _validate_pdf_with_pikepdf(path: Path, password: str | None = None, context: str = "PDF") -> int:
+    import pikepdf
+
+    try:
+        with pikepdf.open(path, password=password or "") as pdf:
+            pages = len(pdf.pages)
+    except Exception as exc:
+        raise CompressionError(
+            f"{context} could not be opened. It may be corrupted or password-protected. "
+            "If it has a password, enter the correct password and try again."
+            f"{_dependency_detail(exc)}"
+        ) from exc
+
+    if pages <= 0:
+        raise CompressionError(f"{context} has no readable pages.")
+    return pages
+
+
+def _validate_pdf_with_poppler(path: Path, password: str | None = None, context: str = "PDF") -> int:
+    _convert_from_path, pdfinfo_from_path = _load_pdf_raster_tools()
+    try:
+        info = pdfinfo_from_path(str(path), userpw=password)
+    except Exception as exc:
+        raise CompressionError(
+            f"{context} could not be opened. It may be corrupted or password-protected. "
+            "If it has a password, enter the correct password and try again."
+            f"{_dependency_detail(exc)}"
+        ) from exc
+
+    try:
+        pages = int(info.get("Pages", 0))
+    except (TypeError, ValueError) as exc:
+        raise CompressionError(f"{context} page count could not be read.") from exc
+    if pages <= 0:
+        raise CompressionError(f"{context} has no readable pages.")
+    return pages
+
+
+def _load_pdf_raster_tools() -> tuple[Callable[..., object], Callable[..., dict[str, object]]]:
+    if find_pdftoppm() is None:
+        raise PdfRasterDependencyError(
+            "Poppler is required for raster compression but pdftoppm was not found in PATH.\n"
+            "Install Poppler, then run this app again:\n"
+            "  macOS:   brew install poppler\n"
+            "  Ubuntu:  sudo apt install poppler-utils\n"
+            "  Windows: choco install poppler"
+        )
+
+    try:
+        from pdf2image import convert_from_path, pdfinfo_from_path
+        from PIL import Image as _Image
+    except ImportError as exc:
+        raise PdfRasterDependencyError(
+            "pdf2image and Pillow are required for raster compression.\n"
+            "Install them in this project environment:\n"
+            "  python3 -m venv .venv\n"
+            "  .venv/bin/python -m pip install pdf2image pillow"
+        ) from exc
+
+    return convert_from_path, pdfinfo_from_path
+
+
+def _load_pikepdf_image_tools() -> tuple[object, object, object, object]:
+    try:
+        import pikepdf
+        from pikepdf import PdfImage
+        from PIL import Image, features
+    except ImportError as exc:
+        raise PdfImageRecompressionError(
+            "pikepdf and Pillow are required for embedded JPEG2000 image recompression.\n"
+            "Install them in this project environment:\n"
+            "  .venv/bin/python -m pip install pikepdf pillow"
+        ) from exc
+
+    if not features.check("jpg_2000"):
+        raise PdfImageRecompressionError(
+            "Pillow is installed without JPEG2000 support, so pikepdf JPEG2000 recompression cannot run."
+        )
+
+    return pikepdf, PdfImage, Image, features
 
 
 def _run_command(command: list[str], output: Path | None) -> None:
@@ -445,13 +1051,14 @@ def _write_jpeg_pdf(images: list[Path], output: Path, dpi: int) -> None:
 
     for index, image_path in enumerate(images, start=1):
         image_data = image_path.read_bytes()
-        width, height = _jpeg_dimensions(image_data)
+        width, height, components = _jpeg_info(image_data)
         page_width = width * 72 / dpi
         page_height = height * 72 / dpi
+        color_space = "/DeviceGray" if components == 1 else "/DeviceRGB"
         image_id = add_object(
             b"<< /Type /XObject /Subtype /Image "
             + f"/Width {width} /Height {height} ".encode("ascii")
-            + b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode "
+            + f"/ColorSpace {color_space} /BitsPerComponent 8 /Filter /DCTDecode ".encode("ascii")
             + f"/Length {len(image_data)} >>\nstream\n".encode("ascii")
             + image_data
             + b"\nendstream"
@@ -499,6 +1106,11 @@ def _write_jpeg_pdf(images: list[Path], output: Path, dpi: int) -> None:
 
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    width, height, _components = _jpeg_info(data)
+    return width, height
+
+
+def _jpeg_info(data: bytes) -> tuple[int, int, int]:
     if not data.startswith(b"\xff\xd8"):
         raise CompressionError("Rendered page is not a JPEG image.")
 
@@ -539,7 +1151,8 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
         if marker in start_of_frame_markers:
             height = int.from_bytes(data[offset + 3 : offset + 5], "big")
             width = int.from_bytes(data[offset + 5 : offset + 7], "big")
-            return width, height
+            components = data[offset + 7]
+            return width, height, components
         offset += segment_length
 
     raise CompressionError("Could not read rendered JPEG dimensions.")
@@ -550,6 +1163,16 @@ def _clean_process_output(chunks: Iterable[str]) -> str:
     if not text:
         return ""
     return f"\n{text[-4000:]}"
+
+
+def _dependency_detail(exc: Exception) -> str:
+    detail = str(exc).strip()
+    return f"\n{detail[-1000:]}" if detail else ""
+
+
+def _short_error(exc: Exception) -> str:
+    detail = str(exc).splitlines()[0].strip()
+    return detail[:160] if detail else exc.__class__.__name__
 
 
 def _delete_if_present(path: Path) -> None:

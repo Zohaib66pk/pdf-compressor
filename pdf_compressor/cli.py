@@ -13,7 +13,7 @@ from .server import run_server
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pdf-compressor",
-        description="Compress PDF files with a local Python interface powered by Ghostscript.",
+        description="Compress PDF files from the command line or the browser UI.",
     )
     parser.add_argument("input", nargs="?", help="PDF file to compress. Omit to open the local web UI.")
     parser.add_argument("-o", "--output", help="Output PDF path.")
@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Compression profile. Default: max.",
     )
     parser.add_argument("--ghostscript", help="Path to a Ghostscript executable.")
+    parser.add_argument("--password", help="Password for protected PDFs.")
+    parser.add_argument("--workers", type=int, help="Parallel page workers for raster compression. Default: 3.")
     parser.add_argument("--server", action="store_true", help="Start the local web interface.")
     parser.add_argument("--host", default="127.0.0.1", help="Host for the web interface.")
     parser.add_argument("--port", type=int, default=8765, help="Port for the web interface.")
@@ -50,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.output) if args.output else None,
             profile_name=args.profile,
             ghostscript_path=args.ghostscript,
+            password=args.password,
+            worker_count=args.workers,
         )
     except CompressionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -58,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Compressed: {result.output_path}")
     print(f"Profile:    {result.profile.label}")
     print(f"Method:     {result.method}")
+    print(f"Workers:    {result.worker_count}")
     print(f"Original:   {format_bytes(result.original_size)}")
     print(f"Output:     {format_bytes(result.compressed_size)}")
     print(f"Savings:    {format_bytes(result.bytes_saved)} ({result.savings_percent:.1f}%)")

@@ -1,4 +1,4 @@
-"""PDF compression tools powered by Ghostscript."""
+"""PDF compression tools."""
 
 from .core import (
     CompressionError,
