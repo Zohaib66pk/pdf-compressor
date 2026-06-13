@@ -527,10 +527,16 @@ def render_home(
 
               <div class="client-error hidden" id="clientError"></div>
               <div class="upload-status hidden" id="uploadStatus">
-                <div class="mini-progress" aria-label="Upload progress">
-                  <div class="mini-progress-meter" id="uploadProgressMeter"></div>
+                <div class="progress-shell" aria-label="PDF progress">
+                  <div class="progress-meter" id="uploadProgressMeter"></div>
                 </div>
                 <p id="uploadStatusText">Preparing your PDF</p>
+                <div class="status-steps" aria-label="Compression status">
+                  <div class="status-step" id="stepUploading"><span class="step-mark"></span><span>Uploading file</span></div>
+                  <div class="status-step" id="stepUploaded"><span class="step-mark"></span><span>File uploaded</span></div>
+                  <div class="status-step" id="stepCompressing"><span class="step-mark"></span><span>Compression in progress</span></div>
+                  <div class="status-step" id="stepReady"><span class="step-mark"></span><span>Compressed file ready</span></div>
+                </div>
               </div>
               <button type="submit">Compress PDF</button>
             </form>
@@ -1013,7 +1019,7 @@ def _page(title: str, body: str) -> str:
     }}
     .upload-status {{
       display: grid;
-      gap: 8px;
+      gap: 10px;
       color: var(--muted);
       font-weight: 750;
     }}
@@ -1021,19 +1027,56 @@ def _page(title: str, body: str) -> str:
       margin: 0;
       overflow-wrap: anywhere;
     }}
-    .mini-progress {{
-      height: 10px;
-      overflow: hidden;
+    .status-steps {{
+      display: grid;
+      gap: 8px;
+      margin-top: 2px;
+    }}
+    .status-step {{
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--muted);
+      font-size: 0.94rem;
+      line-height: 1.35;
+    }}
+    .step-mark {{
+      width: 20px;
+      height: 20px;
+      flex: 0 0 20px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       border: 1px solid var(--line);
       border-radius: 999px;
-      background: #eef0ea;
+      background: #fff;
+      color: #fff;
+      font-size: 0.78rem;
+      font-weight: 900;
     }}
-    .mini-progress-meter {{
-      width: 0%;
-      height: 100%;
-      border-radius: inherit;
+    .status-step.active {{
+      color: var(--ink);
+    }}
+    .status-step.active .step-mark {{
+      border-color: var(--accent);
+      background: #e4f1ed;
+    }}
+    .status-step.active .step-mark::before {{
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
       background: var(--accent);
-      transition: width 180ms ease;
+    }}
+    .status-step.done {{
+      color: var(--accent-dark);
+    }}
+    .status-step.done .step-mark {{
+      border-color: var(--accent);
+      background: var(--accent);
+    }}
+    .status-step.done .step-mark::before {{
+      content: "✓";
     }}
     input:focus,
     select:focus,

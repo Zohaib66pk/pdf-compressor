@@ -4,7 +4,7 @@ A Python PDF compressor with a browser UI, command-line interface, and Vercel se
 
 ## Install system tools
 
-PDF compression requires Ghostscript and Poppler:
+Full local PDF compression is strongest with Ghostscript and Poppler. The hosted Vercel app uses `pypdfium2` for page-by-page compression because it works without system packages.
 
 ```bash
 brew install ghostscript
@@ -63,7 +63,7 @@ For password-protected PDFs:
 .venv/bin/python app.py input.pdf --profile max --password "your-password"
 ```
 
-The compressor tries one target-aware embedded JPEG2000 image recompression pass first because it keeps page text, links, and dimensions intact. If the requested target still cannot be met, it falls back to Ghostscript and then raster page compression.
+The compressor tries one target-aware embedded JPEG2000 image recompression pass first because it keeps page text, links, and dimensions intact. If the requested target still cannot be met, it falls back to Ghostscript when available and then page-by-page compression. On Vercel, page-by-page compression is handled by PDFium through `pypdfium2`.
 
 Raster compression uses 3 parallel workers by default and reports compressed page counts while it runs. Advanced CLI override:
 
@@ -99,7 +99,7 @@ The Vercel handler uses Vercel Blob when `BLOB_READ_WRITE_TOKEN` is configured. 
 
 The app's upload limit is 100 MB. Standard Vercel Functions have a much smaller request and response payload limit, so direct uploads fall back to a guarded small-file path if Blob storage is not configured.
 
-For best compression on strict targets, run the local server or deploy to an environment where Ghostscript and Poppler are installed. Standard Vercel Python Functions do not include those system binaries by default.
+For best compression on strict targets, run the local server with Ghostscript installed. Standard Vercel Python Functions do not include Ghostscript, so the hosted app uses PDFium page rendering for the strongest available fallback there.
 
 ## Profiles
 

@@ -1999,6 +1999,13 @@ var statusBox = document.getElementById("uploadStatus");
 var statusText = document.getElementById("uploadStatusText");
 var progressMeter = document.getElementById("uploadProgressMeter");
 var submitButton = form?.querySelector("button[type='submit']");
+var steps = {
+  uploading: document.getElementById("stepUploading"),
+  uploaded: document.getElementById("stepUploaded"),
+  compressing: document.getElementById("stepCompressing"),
+  ready: document.getElementById("stepReady")
+};
+var compressionProgressTimer = null;
 function showError(message) {
   if (!errorBox) {
     return;
@@ -2025,6 +2032,39 @@ function setStatus(message, percent) {
   if (progressMeter) {
     progressMeter.style.width = `${Math.max(0, Math.min(percent, 100))}%`;
   }
+}
+function setProgress(percent) {
+  if (progressMeter) {
+    progressMeter.style.width = `${Math.max(0, Math.min(percent, 100))}%`;
+  }
+}
+function setStep(name, state) {
+  const step = steps[name];
+  if (!step) {
+    return;
+  }
+  step.classList.remove("active", "done");
+  if (state) {
+    step.classList.add(state);
+  }
+}
+function resetSteps() {
+  Object.keys(steps).forEach((name) => setStep(name, ""));
+}
+function stopCompressionProgress() {
+  if (compressionProgressTimer) {
+    window.clearInterval(compressionProgressTimer);
+    compressionProgressTimer = null;
+  }
+}
+function startCompressionProgress() {
+  stopCompressionProgress();
+  let progress = 62;
+  setProgress(progress);
+  compressionProgressTimer = window.setInterval(() => {
+    progress = Math.min(progress + 1, 94);
+    setProgress(progress);
+  }, 900);
 }
 function setBusy(isBusy) {
   if (!submitButton) {
@@ -2059,6 +2099,8 @@ if (form) {
     }
     setBusy(true);
     try {
+      resetSteps();
+      setStep("uploading", "active");
       setStatus("Uploading your PDF: 0%", 0);
       const pathname = `uploads/${crypto.randomUUID()}-${safeName(file.name)}`;
       const uploaded = await upload(pathname, file, {
@@ -2072,10 +2114,14 @@ if (form) {
         }),
         onUploadProgress: ({ percentage }) => {
           const value = Math.round(percentage || 0);
-          setStatus(`Uploading your PDF: ${value}%`, value);
+          setStatus(`Uploading your PDF: ${value}%`, Math.round(value * 0.55));
         }
       });
-      setStatus("Compressing your PDF", 100);
+      setStep("uploading", "done");
+      setStep("uploaded", "done");
+      setStep("compressing", "active");
+      setStatus("File uploaded. Compression in progress.", 62);
+      startCompressionProgress();
       const response = await fetch("/compress-blob", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2089,16 +2135,22 @@ if (form) {
         })
       });
       const html = await response.text();
+      stopCompressionProgress();
       if (!response.ok) {
         document.open();
         document.write(html);
         document.close();
         return;
       }
+      setStep("compressing", "done");
+      setStep("ready", "done");
+      setStatus("Compression complete. Opening your result.", 100);
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
       document.open();
       document.write(html);
       document.close();
     } catch (error) {
+      stopCompressionProgress();
       showError(error instanceof Error ? error.message : "Upload failed. Try again.");
       setBusy(false);
       setStatus("Ready to try again", 0);

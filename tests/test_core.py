@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from PIL import Image
+
 from pdf_compressor.core import (
     CompressionCandidate,
     ImageRecompressionStats,
@@ -214,6 +216,66 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result.method, "Page-by-page compression")
             self.assertIn((64, 30, False), raster_attempts)
 
+    def test_missing_ghostscript_falls_back_to_raster_compression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.pdf"
+            output = Path(tmp) / "output.pdf"
+            source.write_bytes(b"%PDF-1.4\n" + (b"x" * 12_000))
+
+            def fake_raster(
+                _source,
+                pdf_output,
+                *,
+                setting,
+                ghostscript_path=None,
+                page_count=0,
+                password=None,
+                worker_count=1,
+                page_progress_callback=None,
+            ):
+                pdf_output.write_bytes(b"x" * 4_500)
+
+            with patch("pdf_compressor.core._jpeg2000_settings_for_profile", return_value=()):
+                with patch(
+                    "pdf_compressor.core._run_ghostscript_pdfwrite",
+                    side_effect=GhostscriptMissingError("Ghostscript missing"),
+                ):
+                    with patch("pdf_compressor.core._run_raster_pdf", side_effect=fake_raster):
+                        with patch("pdf_compressor.core._validate_pdf", return_value=1):
+                            result = compress_pdf(
+                                source,
+                                output,
+                                profile_name="max",
+                                target_size_bytes=5_000,
+                            )
+
+            self.assertEqual(result.compressed_size, 4_500)
+            self.assertEqual(result.method, "Page-by-page compression")
+
+    def test_raster_pdf_uses_pdfium_when_poppler_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            image_path = tmp_path / "page.jpg"
+            source = tmp_path / "source.pdf"
+            output = tmp_path / "raster.pdf"
+
+            image = Image.new("RGB", (40, 40), "white")
+            image.save(image_path, "JPEG", quality=80)
+            image.close()
+            _write_jpeg_pdf([image_path], source, dpi=72)
+
+            with patch("pdf_compressor.core.find_pdftoppm", return_value=None):
+                _run_raster_pdf(
+                    source,
+                    output,
+                    setting=RasterSetting(40, 18),
+                    page_count=1,
+                    worker_count=1,
+                )
+
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
     def test_jpeg2000_candidate_can_satisfy_target_before_raster(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.pdf"
@@ -370,18 +432,19 @@ class CoreTests(unittest.TestCase):
                 rendered_pages.append((first_page, last_page, userpw))
                 return [FakeImage()]
 
-            with patch("pdf_compressor.core._load_pdf_raster_tools", return_value=(fake_convert, object())):
-                with patch("pdf_compressor.core._write_jpeg_pdf") as write_pdf:
-                    progress_counts = []
-                    _run_raster_pdf(
-                        source,
-                        output,
-                        setting=RasterSetting(72, 40),
-                        page_count=3,
-                        password="pw",
-                        worker_count=2,
-                        page_progress_callback=lambda completed, total: progress_counts.append((completed, total)),
-                    )
+            with patch("pdf_compressor.core._load_pdfium_renderer", return_value=None):
+                with patch("pdf_compressor.core._load_pdf_raster_tools", return_value=(fake_convert, object())):
+                    with patch("pdf_compressor.core._write_jpeg_pdf") as write_pdf:
+                        progress_counts = []
+                        _run_raster_pdf(
+                            source,
+                            output,
+                            setting=RasterSetting(72, 40),
+                            page_count=3,
+                            password="pw",
+                            worker_count=2,
+                            page_progress_callback=lambda completed, total: progress_counts.append((completed, total)),
+                        )
 
             self.assertEqual(sorted(rendered_pages), [(1, 1, "pw"), (2, 2, "pw"), (3, 3, "pw")])
             self.assertEqual(progress_counts, [(0, 3), (1, 3), (2, 3), (3, 3)])

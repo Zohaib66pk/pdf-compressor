@@ -501,7 +501,26 @@ def _create_candidates(
             f"{label}",
         )
         output = candidate_dir / f"{profile_name}.pdf"
-        _run_ghostscript_pdfwrite(source, output, profile_name, ghostscript_path=ghostscript_path, password=password)
+        try:
+            _run_ghostscript_pdfwrite(source, output, profile_name, ghostscript_path=ghostscript_path, password=password)
+        except GhostscriptMissingError:
+            _delete_if_present(output)
+            completed_attempts += 1
+            _notify_progress(
+                progress_callback,
+                _attempt_progress(completed_attempts, total_attempts),
+                "Moving to page-by-page compression",
+            )
+            break
+        except CompressionError:
+            _delete_if_present(output)
+            completed_attempts += 1
+            _notify_progress(
+                progress_callback,
+                _attempt_progress(completed_attempts, total_attempts),
+                "Trying another compression step",
+            )
+            continue
         if output.exists() and output.stat().st_size > 0:
             candidates.append(CompressionCandidate(output, label))
         completed_attempts += 1
@@ -828,7 +847,7 @@ def _run_raster_pdf(
     page_progress_callback: CountProgressCallback | None = None,
 ) -> None:
     del ghostscript_path
-    convert_from_path, _pdfinfo_from_path = _load_pdf_raster_tools()
+    pdfium = _load_pdfium_renderer()
 
     with tempfile.TemporaryDirectory(prefix="pdf-compressor-pages-", dir=output.parent) as tmp:
         page_dir = Path(tmp)
@@ -836,19 +855,106 @@ def _run_raster_pdf(
         workers = _resolve_worker_count(worker_count, page_total)
         if page_progress_callback is not None:
             page_progress_callback(0, page_total)
-        images = _render_raster_pages(
-            convert_from_path,
-            source,
-            page_dir,
-            page_total=page_total,
-            setting=setting,
-            password=password,
-            worker_count=workers,
-            page_progress_callback=page_progress_callback,
-        )
+        if pdfium is not None:
+            images = _render_pdfium_pages(
+                pdfium,
+                source,
+                page_dir,
+                page_total=page_total,
+                setting=setting,
+                password=password,
+                worker_count=workers,
+                page_progress_callback=page_progress_callback,
+            )
+        else:
+            convert_from_path, _pdfinfo_from_path = _load_pdf_raster_tools()
+            images = _render_raster_pages(
+                convert_from_path,
+                source,
+                page_dir,
+                page_total=page_total,
+                setting=setting,
+                password=password,
+                worker_count=workers,
+                page_progress_callback=page_progress_callback,
+            )
         if not images:
-            raise CompressionError("Poppler did not render any pages for raster compression.")
+            raise CompressionError("Page-by-page compression did not render any pages.")
         _write_jpeg_pdf(images, output, dpi=setting.dpi)
+
+
+def _render_pdfium_pages(
+    pdfium: object,
+    source: Path,
+    page_dir: Path,
+    *,
+    page_total: int,
+    setting: RasterSetting,
+    password: str | None,
+    worker_count: int,
+    page_progress_callback: CountProgressCallback | None = None,
+) -> list[Path]:
+    if worker_count <= 1 or page_total <= 1:
+        images = []
+        for page_number in range(1, page_total + 1):
+            images.append(_render_pdfium_page(pdfium, source, page_dir, page_number, setting, password))
+            if page_progress_callback is not None:
+                page_progress_callback(page_number, page_total)
+        return images
+
+    images_by_page: dict[int, Path] = {}
+    completed_pages = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_render_pdfium_page, pdfium, source, page_dir, page_number, setting, password): page_number
+            for page_number in range(1, page_total + 1)
+        }
+        for future in as_completed(futures):
+            page_number = futures[future]
+            images_by_page[page_number] = future.result()
+            completed_pages += 1
+            if page_progress_callback is not None:
+                page_progress_callback(completed_pages, page_total)
+
+    return [images_by_page[page_number] for page_number in sorted(images_by_page)]
+
+
+def _render_pdfium_page(
+    pdfium: object,
+    source: Path,
+    page_dir: Path,
+    page_number: int,
+    setting: RasterSetting,
+    password: str | None,
+) -> Path:
+    document = None
+    page = None
+    bitmap = None
+    original_image = None
+    image = None
+    try:
+        document = pdfium.PdfDocument(str(source), password=password or None)
+        page = document[page_number - 1]
+        bitmap = page.render(scale=setting.dpi / 72)
+        original_image = bitmap.to_pil()
+        image = original_image
+        mode = "L" if setting.grayscale else "RGB"
+        if image.mode != mode:
+            image = image.convert(mode)
+        image_path = page_dir / f"page-{page_number:05d}.jpg"
+        image.save(image_path, "JPEG", quality=setting.quality, optimize=True)
+        return image_path
+    except Exception as exc:
+        raise CompressionError(f"Could not render page {page_number} for compression.{_dependency_detail(exc)}") from exc
+    finally:
+        if image is not None and image is not original_image:
+            image.close()
+        if original_image is not None:
+            original_image.close()
+        for item in (bitmap, page, document):
+            close = getattr(item, "close", None)
+            if close is not None:
+                close()
 
 
 def _render_raster_pages(
@@ -978,8 +1084,9 @@ def _validate_pdf_with_poppler(path: Path, password: str | None = None, context:
 def _load_pdf_raster_tools() -> tuple[Callable[..., object], Callable[..., dict[str, object]]]:
     if find_pdftoppm() is None:
         raise PdfRasterDependencyError(
-            "Poppler is required for raster compression but pdftoppm was not found in PATH.\n"
-            "Install Poppler, then run this app again:\n"
+            "PDFium or Poppler is required for page-by-page compression, but neither is available.\n"
+            "Install pypdfium2 or Poppler, then run this app again:\n"
+            "  Python:  .venv/bin/python -m pip install pypdfium2\n"
             "  macOS:   brew install poppler\n"
             "  Ubuntu:  sudo apt install poppler-utils\n"
             "  Windows: choco install poppler"
@@ -997,6 +1104,14 @@ def _load_pdf_raster_tools() -> tuple[Callable[..., object], Callable[..., dict[
         ) from exc
 
     return convert_from_path, pdfinfo_from_path
+
+
+def _load_pdfium_renderer() -> object | None:
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    return pdfium
 
 
 def _load_pikepdf_image_tools() -> tuple[object, object, object, object]:
