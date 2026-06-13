@@ -532,10 +532,8 @@ def render_home(
                 </div>
                 <p id="uploadStatusText">Preparing your PDF</p>
                 <div class="status-steps" aria-label="Compression status">
-                  <div class="status-step" id="stepUploading"><span class="step-mark"></span><span>Uploading file</span></div>
-                  <div class="status-step" id="stepUploaded"><span class="step-mark"></span><span>File uploaded</span></div>
+                  <div class="status-step" id="stepFile"><span class="step-mark"></span><span id="stepFileText">File uploading</span></div>
                   <div class="status-step" id="stepCompressing"><span class="step-mark"></span><span>Compression in progress</span></div>
-                  <div class="status-step" id="stepReady"><span class="step-mark"></span><span>Compressed file ready</span></div>
                 </div>
               </div>
               <button type="submit">Compress PDF</button>

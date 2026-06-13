@@ -126,8 +126,10 @@ class ServerRenderTests(unittest.TestCase):
         self.assertIn("PDF file (max 100.00 MB)", html)
         self.assertIn('data-blob-upload="true"', html)
         self.assertIn("/blob-upload-client.js", html)
-        self.assertIn("File uploaded", html)
+        self.assertIn("File uploading", html)
         self.assertIn("Compression in progress", html)
+        self.assertNotIn("Uploading file", html)
+        self.assertNotIn("Compressed file ready", html)
 
 
 if __name__ == "__main__":

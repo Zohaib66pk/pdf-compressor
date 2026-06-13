@@ -2000,11 +2000,10 @@ var statusText = document.getElementById("uploadStatusText");
 var progressMeter = document.getElementById("uploadProgressMeter");
 var submitButton = form?.querySelector("button[type='submit']");
 var steps = {
-  uploading: document.getElementById("stepUploading"),
-  uploaded: document.getElementById("stepUploaded"),
-  compressing: document.getElementById("stepCompressing"),
-  ready: document.getElementById("stepReady")
+  file: document.getElementById("stepFile"),
+  compressing: document.getElementById("stepCompressing")
 };
+var stepFileText = document.getElementById("stepFileText");
 var compressionProgressTimer = null;
 function showError(message) {
   if (!errorBox) {
@@ -2050,6 +2049,11 @@ function setStep(name, state) {
 }
 function resetSteps() {
   Object.keys(steps).forEach((name) => setStep(name, ""));
+}
+function setFileStepText(message) {
+  if (stepFileText) {
+    stepFileText.textContent = message;
+  }
 }
 function stopCompressionProgress() {
   if (compressionProgressTimer) {
@@ -2100,8 +2104,9 @@ if (form) {
     setBusy(true);
     try {
       resetSteps();
-      setStep("uploading", "active");
-      setStatus("Uploading your PDF: 0%", 0);
+      setFileStepText("File uploading");
+      setStep("file", "active");
+      setStatus("File uploading: 0%", 0);
       const pathname = `uploads/${crypto.randomUUID()}-${safeName(file.name)}`;
       const uploaded = await upload(pathname, file, {
         access: "public",
@@ -2114,11 +2119,11 @@ if (form) {
         }),
         onUploadProgress: ({ percentage }) => {
           const value = Math.round(percentage || 0);
-          setStatus(`Uploading your PDF: ${value}%`, Math.round(value * 0.55));
+          setStatus(`File uploading: ${value}%`, Math.round(value * 0.55));
         }
       });
-      setStep("uploading", "done");
-      setStep("uploaded", "done");
+      setFileStepText("File uploaded");
+      setStep("file", "done");
       setStep("compressing", "active");
       setStatus("File uploaded. Compression in progress.", 62);
       startCompressionProgress();
@@ -2143,7 +2148,6 @@ if (form) {
         return;
       }
       setStep("compressing", "done");
-      setStep("ready", "done");
       setStatus("Compression complete. Opening your result.", 100);
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       document.open();
