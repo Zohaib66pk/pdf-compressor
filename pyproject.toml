@@ -1,0 +1,10 @@
+[project]
+name = "pdf-compressor"
+version = "0.1.0"
+description = "Local Python PDF compression app powered by Ghostscript"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+pdf-compressor = "pdf_compressor.cli:main"
