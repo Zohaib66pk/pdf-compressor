@@ -7,6 +7,7 @@ from PIL import Image
 
 from pdf_compressor.core import (
     CompressionCandidate,
+    CompressionError,
     ImageRecompressionStats,
     Jpeg2000Setting,
     CompressionNotUsefulError,
@@ -275,6 +276,41 @@ class CoreTests(unittest.TestCase):
 
             self.assertTrue(output.exists())
             self.assertGreater(output.stat().st_size, 0)
+
+    def test_raster_pdf_falls_back_when_pdfium_cannot_read_page(self):
+        class FakeImage:
+            mode = "RGB"
+
+            def save(self, path, _format, *, quality, optimize):
+                Path(path).write_bytes(b"jpeg")
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.pdf"
+            output = Path(tmp) / "output.pdf"
+            source.write_bytes(b"%PDF-1.4\nfake")
+
+            def fake_convert(_source, *, first_page, last_page, userpw, **_kwargs):
+                return [FakeImage()]
+
+            with patch("pdf_compressor.core._load_pdfium_renderer", return_value=object()):
+                with patch(
+                    "pdf_compressor.core._render_pdfium_pages",
+                    side_effect=CompressionError("Could not render page 1 for compression."),
+                ):
+                    with patch("pdf_compressor.core._load_pdf_raster_tools", return_value=(fake_convert, object())):
+                        with patch("pdf_compressor.core._write_jpeg_pdf") as write_pdf:
+                            _run_raster_pdf(
+                                source,
+                                output,
+                                setting=RasterSetting(72, 40),
+                                page_count=1,
+                                worker_count=1,
+                            )
+
+            write_pdf.assert_called_once()
 
     def test_jpeg2000_candidate_can_satisfy_target_before_raster(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,7 +2,13 @@ import unittest
 from pathlib import Path
 import tempfile
 
-from pdf_compressor.server import CompressorRequestHandler, _impact_items, _job_status_payload, render_home
+from pdf_compressor.server import (
+    CompressorRequestHandler,
+    _impact_items,
+    _job_status_payload,
+    _public_error_message,
+    render_home,
+)
 
 
 class ServerImpactTests(unittest.TestCase):
@@ -132,6 +138,17 @@ class ServerRenderTests(unittest.TestCase):
         self.assertNotIn("Preparing your PDF", html)
         self.assertNotIn("Uploading file", html)
         self.assertNotIn("Compressed file ready", html)
+
+    def test_public_error_message_hides_renderer_details(self):
+        message = _public_error_message(
+            "Could not render page 1 for compression.\n"
+            "Failed to load document (PDFium: Data format error)."
+        )
+
+        self.assertIn("could not be read", message)
+        self.assertNotIn("PDFium", message)
+        self.assertNotIn("Data format", message)
+        self.assertNotIn("render page", message)
 
 
 if __name__ == "__main__":

@@ -855,29 +855,43 @@ def _run_raster_pdf(
         workers = _resolve_worker_count(worker_count, page_total)
         if page_progress_callback is not None:
             page_progress_callback(0, page_total)
+        images: list[Path] = []
+        pdfium_error: CompressionError | None = None
         if pdfium is not None:
-            images = _render_pdfium_pages(
-                pdfium,
-                source,
-                page_dir,
-                page_total=page_total,
-                setting=setting,
-                password=password,
-                worker_count=workers,
-                page_progress_callback=page_progress_callback,
-            )
-        else:
-            convert_from_path, _pdfinfo_from_path = _load_pdf_raster_tools()
-            images = _render_raster_pages(
-                convert_from_path,
-                source,
-                page_dir,
-                page_total=page_total,
-                setting=setting,
-                password=password,
-                worker_count=workers,
-                page_progress_callback=page_progress_callback,
-            )
+            try:
+                images = _render_pdfium_pages(
+                    pdfium,
+                    source,
+                    page_dir,
+                    page_total=page_total,
+                    setting=setting,
+                    password=password,
+                    worker_count=workers,
+                    page_progress_callback=page_progress_callback,
+                )
+            except CompressionError as exc:
+                pdfium_error = exc
+                _delete_rendered_pages(page_dir)
+                if page_progress_callback is not None:
+                    page_progress_callback(0, page_total)
+
+        if not images:
+            try:
+                convert_from_path, _pdfinfo_from_path = _load_pdf_raster_tools()
+                images = _render_raster_pages(
+                    convert_from_path,
+                    source,
+                    page_dir,
+                    page_total=page_total,
+                    setting=setting,
+                    password=password,
+                    worker_count=workers,
+                    page_progress_callback=page_progress_callback,
+                )
+            except CompressionError as exc:
+                if pdfium_error is not None:
+                    raise CompressionError(_unreadable_pdf_message()) from pdfium_error
+                raise
         if not images:
             raise CompressionError("Page-by-page compression did not render any pages.")
         _write_jpeg_pdf(images, output, dpi=setting.dpi)
@@ -1295,6 +1309,18 @@ def _delete_if_present(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _delete_rendered_pages(page_dir: Path) -> None:
+    for image_path in page_dir.glob("page-*.jpg"):
+        _delete_if_present(image_path)
+
+
+def _unreadable_pdf_message() -> str:
+    return (
+        "This PDF could not be read for compression. It may be damaged, incomplete, or locked. "
+        "Try downloading or exporting the PDF again. If it has a password, enter it and try again."
+    )
 
 
 def _missing_ghostscript_message() -> str:

@@ -828,6 +828,31 @@ def _raster_impact_items(method: str) -> list[tuple[str, str]]:
 
 def _public_error_message(message: str) -> str:
     lower = message.lower()
+    needs_extra_support = (
+        "required for page-by-page compression" in lower
+        or "required for raster compression" in lower
+        or "not available on this server" in lower
+    )
+    if needs_extra_support:
+        return (
+            "This PDF needs an extra shrinking step that is not available on this server. "
+            "Try a larger target size, or run the app where full compression support is installed."
+        )
+    if (
+        "pdfium" in lower
+        or "failed to load document" in lower
+        or "data format error" in lower
+        or "could not render page" in lower
+        or "did not render page" in lower
+        or "could not be opened" in lower
+        or "corrupted" in lower
+        or "password-protected" in lower
+        or "no readable pages" in lower
+    ):
+        return (
+            "This PDF could not be read for compression. It may be damaged, incomplete, or locked. "
+            "Try downloading or exporting the PDF again. If it has a password, enter it and try again."
+        )
     if "ghostscript" in lower:
         return (
             "This PDF needs a stronger compression step that is not available on this server. "
@@ -856,7 +881,7 @@ def render_error(message: str) -> str:
               <h1>Compression stopped</h1>
               <span class="status warning">Check</span>
             </div>
-            <pre class="error">{escape(message)}</pre>
+            <p class="error">{escape(message)}</p>
             <div class="actions">
               <a class="secondary" href="/">Back</a>
             </div>
@@ -1221,7 +1246,9 @@ def _page(title: str, body: str) -> str:
       background: #fff7f5;
       color: var(--bad);
       padding: 16px;
-      font: 0.95rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.95rem;
+      line-height: 1.45;
+      font-weight: 750;
     }}
     .hidden {{ display: none !important; }}
     @media (max-width: 560px) {{
